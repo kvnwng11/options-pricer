@@ -8,7 +8,6 @@ using namespace pricing;
 // ─────────────────────────────────────────────
 //  Test fixtures & helpers
 // ─────────────────────────────────────────────
-static constexpr double PRICE_TOL  = 1e-6;   // pricing precision
 static constexpr double GREEK_TOL  = 1e-5;   // greek precision
 static constexpr double IV_TOL     = 1e-6;   // IV round-trip tolerance
 
@@ -25,22 +24,57 @@ static constexpr double BUMP_SIGMA   = 0.01;   // 1 vol point — first-order (v
 static constexpr double BUMP_R       = 0.0001; // 1bp rate — first-order (rho)
 
 // ─────────────────────────────────────────────
-//  1. Put-Call Parity
+//  1. Put-Call Parity (property-based)
+//
+//  C - P = S*e^{-qT} - K*e^{-rT}
+//
+//  Verified across 500 randomised parameter combinations covering
+//  a wide range of moneyness, vol, rate, and maturity regimes.
+//  Tolerance is 1e-10 -- this is an exact algebraic identity in
+//  Black-Scholes, not an approximation, so it holds to near
+//  machine precision regardless of inputs.
 // ─────────────────────────────────────────────
-TEST(BlackScholes, PutCallParity) {
-    const double S = 100, K = 100, r = 0.05, q = 0.02, sigma = 0.20, T = 1.0;
+TEST(BlackScholes, PutCallParityPropertyBased) {
+    // Xorshift64 -- deterministic, reproducible, no <random> dependency
+    uint64_t seed = 0xDEADBEEFCAFEBABEULL;
+    auto next = [&]() -> double {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return static_cast<double>(seed >> 11) / static_cast<double>(1ULL << 53);
+    };
+    auto uniform = [&](double lo, double hi) { return lo + next() * (hi - lo); };
 
-    BSParams call_p{S, K, r, q, sigma, T, OptionType::Call};
-    BSParams put_p {S, K, r, q, sigma, T, OptionType::Put };
+    constexpr int    N_TRIALS = 500;
+    constexpr double TOL      = 1e-10;
 
-    const double C = BlackScholesEngine::price(call_p).price;
-    const double P = BlackScholesEngine::price(put_p ).price;
+    int failures = 0;
+    for (int i = 0; i < N_TRIALS; ++i) {
+        const double S     = uniform(10.0,   500.0);
+        const double K     = uniform(10.0,   500.0);
+        const double r     = uniform(0.0,    0.15);
+        const double q     = uniform(0.0,    0.10);
+        const double sigma = uniform(0.05,   1.50);
+        const double T     = uniform(1.0/365.0, 5.0);
 
-    // C - P = S*e^{-qT} - K*e^{-rT}
-    const double lhs = C - P;
-    const double rhs = S * std::exp(-q * T) - K * std::exp(-r * T);
+        BSParams call_p{S, K, r, q, sigma, T, OptionType::Call};
+        BSParams put_p {S, K, r, q, sigma, T, OptionType::Put };
 
-    EXPECT_NEAR(lhs, rhs, PRICE_TOL);
+        const double C   = BlackScholesEngine::price(call_p).price;
+        const double P   = BlackScholesEngine::price(put_p ).price;
+        const double lhs = C - P;
+        const double rhs = S * std::exp(-q * T) - K * std::exp(-r * T);
+
+        if (std::abs(lhs - rhs) > TOL) {
+            ADD_FAILURE() << "Put-call parity violated on trial " << i << ":"
+                          << "  S=" << S << " K=" << K << " r=" << r
+                          << " q=" << q << " sigma=" << sigma << " T=" << T << ""
+                          << "  C-P=" << lhs << "  rhs=" << rhs
+                          << "  diff=" << std::abs(lhs - rhs);
+            ++failures;
+        }
+    }
+    EXPECT_EQ(failures, 0) << failures << "/" << N_TRIALS << " trials failed";
 }
 
 // ─────────────────────────────────────────────
@@ -173,38 +207,76 @@ TEST(BlackScholes, RhoMatchesFiniteDifference) {
 }
 
 // ─────────────────────────────────────────────
-//  6. Implied Volatility — round-trip
+//  6. Implied Volatility — round-trip (property-based)
+//
+//  For any valid (S, K, r, q, sigma, T), pricing an option then
+//  solving for IV must recover the original sigma exactly.
+//  Tested across 500 randomised trials covering both calls and puts,
+//  spanning deep ITM/OTM, short/long dated, and low/high vol regimes.
+//
+//  Skipped trials: deep OTM options with very short maturity produce
+//  prices so close to zero that the IV solver has no meaningful signal
+//  to invert — these are noted and skipped rather than failed.
 // ─────────────────────────────────────────────
-TEST(BlackScholes, IVRoundTripCall) {
-    auto p = atm();
-    const double mkt_price = BlackScholesEngine::price(p).price;
-    const double iv = BlackScholesEngine::impliedVol(
-        mkt_price, p.S, p.K, p.r, p.q, p.T, OptionType::Call);
-    EXPECT_NEAR(iv, p.sigma, IV_TOL);
-}
+TEST(BlackScholes, IVRoundTripPropertyBased) {
+    uint64_t seed = 0xC0FFEE12345678ABULL;
+    auto next = [&]() -> double {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return static_cast<double>(seed >> 11) / static_cast<double>(1ULL << 53);
+    };
+    auto uniform = [&](double lo, double hi) { return lo + next() * (hi - lo); };
 
-TEST(BlackScholes, IVRoundTripPut) {
-    auto p = atm(); p.type = OptionType::Put;
-    const double mkt_price = BlackScholesEngine::price(p).price;
-    const double iv = BlackScholesEngine::impliedVol(
-        mkt_price, p.S, p.K, p.r, p.q, p.T, OptionType::Put);
-    EXPECT_NEAR(iv, p.sigma, IV_TOL);
-}
+    constexpr int    N_TRIALS  = 500;
+    constexpr double IV_TOL_PT = 1e-6;   // round-trip tolerance: recover sigma to 1e-6
+    constexpr double MIN_PRICE = 1e-6;   // skip trials where option price is effectively zero
 
-TEST(BlackScholes, IVRoundTripOTMCall) {
-    BSParams p{100.0, 110.0, 0.05, 0.0, 0.25, 0.5, OptionType::Call};
-    const double mkt_price = BlackScholesEngine::price(p).price;
-    const double iv = BlackScholesEngine::impliedVol(
-        mkt_price, p.S, p.K, p.r, p.q, p.T, OptionType::Call);
-    EXPECT_NEAR(iv, p.sigma, IV_TOL);
-}
+    int failures = 0;
+    int skipped  = 0;
 
-TEST(BlackScholes, IVRoundTripHighVol) {
-    BSParams p{100.0, 100.0, 0.05, 0.0, 0.80, 1.0, OptionType::Call};
-    const double mkt_price = BlackScholesEngine::price(p).price;
-    const double iv = BlackScholesEngine::impliedVol(
-        mkt_price, p.S, p.K, p.r, p.q, p.T, OptionType::Call);
-    EXPECT_NEAR(iv, p.sigma, IV_TOL);
+    for (int i = 0; i < N_TRIALS; ++i) {
+        const double S     = uniform(20.0,   300.0);
+        const double K     = uniform(20.0,   300.0);
+        const double r     = uniform(0.0,    0.10);
+        const double q     = uniform(0.0,    0.08);
+        const double sigma = uniform(0.05,   1.00);   // 5% to 100% vol
+        const double T     = uniform(1.0/52.0, 3.0);  // 1 week to 3 years
+        // Alternate call/put on each trial to cover both types
+        const OptionType type = (i % 2 == 0) ? OptionType::Call : OptionType::Put;
+
+        BSParams p{S, K, r, q, sigma, T, type};
+        const double mkt_price = BlackScholesEngine::price(p).price;
+
+        // Skip near-zero prices — IV is numerically undefined here
+        if (mkt_price < MIN_PRICE) {
+            ++skipped;
+            continue;
+        }
+
+        try {
+            const double iv = BlackScholesEngine::impliedVol(
+                mkt_price, S, K, r, q, T, type);
+
+            if (std::abs(iv - sigma) > IV_TOL_PT) {
+                ADD_FAILURE() << "IV round-trip failed on trial " << i << ":\n"
+                              << "  type="  << (type == OptionType::Call ? "Call" : "Put")
+                              << " S=" << S << " K=" << K << " r=" << r
+                              << " q=" << q << " sigma=" << sigma << " T=" << T << "\n"
+                              << "  mkt_price=" << mkt_price
+                              << "  solved_iv=" << iv
+                              << "  diff=" << std::abs(iv - sigma);
+                ++failures;
+            }
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "IV solver threw on trial " << i << ": " << e.what() << "\n"
+                          << "  S=" << S << " K=" << K << " sigma=" << sigma << " T=" << T;
+            ++failures;
+        }
+    }
+
+    EXPECT_EQ(failures, 0) << failures << "/" << N_TRIALS << " trials failed ("
+                           << skipped << " skipped — price below " << MIN_PRICE << ")";
 }
 
 // ─────────────────────────────────────────────

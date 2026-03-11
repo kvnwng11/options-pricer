@@ -9,7 +9,6 @@ using namespace pricing;
 //  Test fixtures & helpers
 // ─────────────────────────────────────────────
 static constexpr double GREEK_TOL  = 1e-5;   // greek precision
-static constexpr double IV_TOL     = 1e-6;   // IV round-trip tolerance
 
 // Canonical ATM params used across many tests
 static BSParams atm() {

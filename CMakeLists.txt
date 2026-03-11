@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(BlackScholesEngine CXX)
+project(OptionsPricingEngine CXX)
 
 # ─────────────────────────────────────────────
 #  C++ standard & compiler flags
@@ -14,40 +14,46 @@ else()
     add_compile_options(
         -Wall -Wextra -Wpedantic -Werror
         -O2 -march=native
-        -fno-math-errno          # safe; we validate inputs before calling libm
+        -fno-math-errno
     )
 endif()
 
 # ─────────────────────────────────────────────
-#  Pricing library
-# ─────────────────────────────────────────────
-add_library(bs_engine STATIC
-    src/black_scholes.cpp
-)
-
-target_include_directories(bs_engine
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-# Link math library on Linux/macOS
-target_link_libraries(bs_engine PUBLIC m)
-
-# ─────────────────────────────────────────────
-#  Optional: OpenMP (used later by MC engine)
+#  Optional: OpenMP
 # ─────────────────────────────────────────────
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(bs_engine PUBLIC OpenMP::OpenMP_CXX)
     message(STATUS "OpenMP found — parallel pricing enabled")
 else()
     message(WARNING "OpenMP not found — single-threaded build")
 endif()
 
 # ─────────────────────────────────────────────
-#  Executable demo (optional smoke test)
+#  Black-Scholes library
 # ─────────────────────────────────────────────
-add_executable(bs_demo src/main.cpp)
-target_link_libraries(bs_demo PRIVATE bs_engine)
+add_library(bs_engine STATIC
+    src/black_scholes.cpp
+)
+target_include_directories(bs_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(bs_engine PUBLIC m)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bs_engine PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# ─────────────────────────────────────────────
+#  American Options Tree library
+# ─────────────────────────────────────────────
+add_library(american_engine STATIC
+    src/american_options.cpp
+)
+target_include_directories(american_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(american_engine PUBLIC bs_engine)  # reuses OptionType, Greeks
+
+# ─────────────────────────────────────────────
+#  Demo executable
+# ─────────────────────────────────────────────
+add_executable(pricing_demo src/main.cpp)
+target_link_libraries(pricing_demo PRIVATE bs_engine american_engine)
 
 # ─────────────────────────────────────────────
 #  Unit tests (Google Test)
@@ -58,7 +64,6 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG        v1.14.0
 )
-# Prevent GTest from overriding our compiler/linker settings
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
@@ -67,22 +72,26 @@ enable_testing()
 add_executable(bs_tests
     tests/test_black_scholes.cpp
 )
+target_link_libraries(bs_tests PRIVATE bs_engine GTest::gtest_main)
 
-target_link_libraries(bs_tests
-    PRIVATE bs_engine GTest::gtest_main
+add_executable(american_tests
+    tests/test_american_options.cpp
 )
+target_link_libraries(american_tests PRIVATE american_engine GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(bs_tests)
+gtest_discover_tests(american_tests)
 
 # ─────────────────────────────────────────────
 #  Build summary
 # ─────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "──────────────────────────────────────")
-message(STATUS "  Black-Scholes Engine")
+message(STATUS "──────────────────────────────────────────")
+message(STATUS "  Options Pricing Engine")
 message(STATUS "  Build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ std    : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  OpenMP     : ${OpenMP_CXX_FOUND}")
-message(STATUS "──────────────────────────────────────")
+message(STATUS "  Targets    : bs_engine, american_engine")
+message(STATUS "──────────────────────────────────────────")
 message(STATUS "")

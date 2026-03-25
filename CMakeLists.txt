@@ -62,10 +62,23 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 # ─────────────────────────────────────────────
+#  SIMD Batch Pricing library
+#
+#  -march=native (set globally above) enables AVX2/SSE4 automatically
+#  on supported hardware. The code detects availability at compile time
+#  via __AVX2__ / __SSE4_1__ macros and falls back to scalar if absent.
+# ─────────────────────────────────────────────
+add_library(simd_engine STATIC
+    src/simd_pricer.cpp
+)
+target_include_directories(simd_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(simd_engine PUBLIC bs_engine)
+
+# ─────────────────────────────────────────────
 #  Demo executable
 # ─────────────────────────────────────────────
 add_executable(pricing_demo src/main.cpp)
-target_link_libraries(pricing_demo PRIVATE bs_engine american_engine mc_engine)
+target_link_libraries(pricing_demo PRIVATE bs_engine american_engine mc_engine simd_engine)
 
 # ─────────────────────────────────────────────
 #  Unit tests (Google Test)
@@ -90,20 +103,25 @@ target_link_libraries(american_tests PRIVATE american_engine GTest::gtest_main)
 add_executable(mc_tests tests/test_monte_carlo.cpp)
 target_link_libraries(mc_tests PRIVATE mc_engine GTest::gtest_main)
 
+add_executable(simd_tests tests/test_simd_pricer.cpp)
+target_link_libraries(simd_tests PRIVATE simd_engine GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(bs_tests)
 gtest_discover_tests(american_tests)
 gtest_discover_tests(mc_tests)
+gtest_discover_tests(simd_tests)
 
 # ─────────────────────────────────────────────
 #  Build summary
 # ─────────────────────────────────────────────
 message(STATUS "")
-message(STATUS "──────────────────────────────────────────────────")
+message(STATUS "──────────────────────────────────────────────────────────")
 message(STATUS "  Options Pricing Engine")
 message(STATUS "  Build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ std    : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  OpenMP     : ${OpenMP_CXX_FOUND}")
-message(STATUS "  Targets    : bs_engine, american_engine, mc_engine")
-message(STATUS "──────────────────────────────────────────────────")
+message(STATUS "  Targets    : bs_engine, american_engine, mc_engine, simd_engine")
+message(STATUS "  AVX2       : enabled via -march=native (if CPU supports it)")
+message(STATUS "──────────────────────────────────────────────────────────")
 message(STATUS "")

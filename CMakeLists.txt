@@ -13,9 +13,18 @@ if(MSVC)
 else()
     add_compile_options(
         -Wall -Wextra -Wpedantic -Werror
-        -O2 -march=native
+        -O2
         -fno-math-errno
     )
+    # -march=native is x86-only; use -mcpu=native on ARM
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+    check_cxx_compiler_flag("-mcpu=native"  COMPILER_SUPPORTS_MCPU_NATIVE)
+    if(COMPILER_SUPPORTS_MARCH_NATIVE)
+        add_compile_options(-march=native)
+    elseif(COMPILER_SUPPORTS_MCPU_NATIVE)
+        add_compile_options(-mcpu=native)
+    endif()
 endif()
 
 # ─────────────────────────────────────────────

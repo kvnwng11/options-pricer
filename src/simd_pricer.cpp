@@ -10,7 +10,11 @@
 
 #if PRICING_HAS_AVX2
     #include <immintrin.h>
-#elif PRICING_HAS_SSE4
+#endif
+#if PRICING_HAS_NEON
+    #include <arm_neon.h>
+#endif
+#if PRICING_HAS_SSE4
     #include <smmintrin.h>
 #endif
 
@@ -51,8 +55,10 @@ void BatchInput::fill(
 const char* SIMDBatchPricer::simdLevel() {
 #if PRICING_HAS_AVX2
     return "AVX2 (8 floats/cycle)";
+#elif PRICING_HAS_NEON
+    return "NEON (4 floats/cycle)";
 #elif PRICING_HAS_SSE4
-    return "SSE4.1 (4 floats/cycle)";
+    return "SSE4.1 (scalar double)";
 #else
     return "Scalar (fallback)";
 #endif
@@ -311,7 +317,239 @@ void SIMDBatchPricer::greeksAVX2(const BatchInput& in, BatchOutput& out, std::si
 // ─────────────────────────────────────────────
 //  SSE4.1 implementation — 4 options per iteration
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+//  NEON implementation — 4 float options per iteration
+//
+//  Runs natively on Apple Silicon (M1/M2/M3/M4) and ARM Cortex.
+//  Uses the same Cephes/A&S polynomial approximations as the AVX2
+//  path, ported to ARM float32x4_t intrinsics.
+//
+//  Naming conventions:
+//    vdupq_n_f32(x)   — broadcast scalar x to all 4 lanes
+//    vaddq_f32(a,b)   — a + b elementwise
+//    vmulq_f32(a,b)   — a * b elementwise
+//    vfmaq_f32(c,a,b) — c + a*b  (FMA, available on ARMv8)
+//    vcgtq_f32(a,b)   — a > b bitmask
+//    vbslq_f32(m,a,b) — blend: m ? a : b
+// ─────────────────────────────────────────────
+#if PRICING_HAS_NEON
+
+// ── neon_exp: Cephes method, exp(x) = 2^(x/ln2) ────────────────────────────
+// vfmaq_f32(c, a, b) = c + a*b
+// Horner: ((((c5*t + c4)*t + c3)*t + c2)*t + 1)*t + 1
+static inline float32x4_t neon_exp(float32x4_t arg) {
+    const float32x4_t log2e  = vdupq_n_f32(1.44269504f);
+    const float32x4_t ln2_hi = vdupq_n_f32(0.693359375f);
+    const float32x4_t ln2_lo = vdupq_n_f32(-2.12194440e-4f);
+    const float32x4_t half   = vdupq_n_f32(0.5f);
+    const float32x4_t ones   = vdupq_n_f32(1.0f);
+
+    // fx = floor(arg * log2e + 0.5)
+    float32x4_t fx  = vrndmq_f32(vaddq_f32(vmulq_f32(arg, log2e), half));
+    // tmp = arg - fx*ln2  (two-step for accuracy)
+    float32x4_t tmp = vfmsq_f32(arg, fx, ln2_hi);   // arg - fx*ln2_hi
+    tmp             = vfmsq_f32(tmp, fx, ln2_lo);   // tmp - fx*ln2_lo
+
+    // Polynomial: 1 + t*(1 + t*(1/2 + t*(1/6 + t*(1/24 + t/120))))
+    float32x4_t y = vdupq_n_f32(1.0f / 120.0f);
+    y = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f),  y, tmp);
+    y = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f),   y, tmp);
+    y = vfmaq_f32(vdupq_n_f32(1.0f / 2.0f),   y, tmp);
+    y = vfmaq_f32(ones,                         y, tmp);
+    y = vfmaq_f32(ones,                         y, tmp);
+
+    // Scale by 2^fx: set exponent field of float
+    int32x4_t emm0 = vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127));
+    emm0           = vshlq_n_s32(emm0, 23);
+    return vmulq_f32(y, vreinterpretq_f32_s32(emm0));
+}
+
+// ── neon_log: atanh-based, log(x) = 2*atanh((m-1)/(m+1)) + exp_f*ln2 ──────
+static inline float32x4_t neon_log(float32x4_t x) {
+    const float32x4_t ones  = vdupq_n_f32(1.0f);
+    const float32x4_t sqrt2 = vdupq_n_f32(1.4142135f);
+    const float32x4_t ln2   = vdupq_n_f32(0.693147180f);
+
+    // Extract biased exponent, subtract 127
+    int32x4_t xi    = vreinterpretq_s32_f32(x);
+    int32x4_t exp_i = vsubq_s32(
+        vshrq_n_s32(vandq_s32(xi, vdupq_n_s32(0x7F800000)), 23),
+        vdupq_n_s32(127));
+    float32x4_t exp_f = vcvtq_f32_s32(exp_i);
+
+    // Normalise mantissa to [1, 2)
+    int32x4_t mant_i = vorrq_s32(
+        vandq_s32(xi, vdupq_n_s32(0x007FFFFF)),
+        vdupq_n_s32(0x3F800000));
+    float32x4_t m = vreinterpretq_f32_s32(mant_i);
+
+    // Further reduce [1,2) → [1, sqrt(2)]: if m > sqrt(2), halve it and add 1 to exp
+    uint32x4_t gt = vcgtq_f32(m, sqrt2);
+    m     = vbslq_f32(gt, vmulq_f32(m, vdupq_n_f32(0.5f)), m);
+    exp_f = vaddq_f32(exp_f, vreinterpretq_f32_u32(vandq_u32(gt, vreinterpretq_u32_f32(ones))));
+
+    // t = (m-1)/(m+1),  log(m) = 2*t*(1 + t²*(1/3 + t²*(1/5 + t²/7)))
+    float32x4_t t  = vdivq_f32(vsubq_f32(m, ones), vaddq_f32(m, ones));
+    float32x4_t t2 = vmulq_f32(t, t);
+
+    // Horner for atanh polynomial P(t²): 1 + t²*(1/3 + t²*(1/5 + t²/7))
+    float32x4_t poly = vdupq_n_f32(1.0f / 7.0f);
+    poly = vfmaq_f32(vdupq_n_f32(1.0f / 5.0f), poly, t2);
+    poly = vfmaq_f32(vdupq_n_f32(1.0f / 3.0f), poly, t2);
+    poly = vfmaq_f32(ones,                      poly, t2);
+
+    // log(m) = 2*t*P(t²),  log(x) = log(m) + exp_f*ln2
+    float32x4_t log_m = vmulq_f32(vmulq_f32(vdupq_n_f32(2.0f), t), poly);
+    return vfmaq_f32(log_m, exp_f, ln2);
+}
+
+// ── neon_norm_cdf: Abramowitz & Stegun §26.2.17 ─────────────────────────────
+// t = 1/(1 + 0.2316419*|x|),  N(x) = 1 - pdf(x)*poly(t) for x >= 0
+static inline float32x4_t neon_norm_cdf(float32x4_t x) {
+    const float32x4_t ones        = vdupq_n_f32(1.0f);
+    const float32x4_t zeros       = vdupq_n_f32(0.0f);
+    const float32x4_t inv_sqrt2pi = vdupq_n_f32(0.398942280f);
+    const float32x4_t p_coef      = vdupq_n_f32(0.2316419f);
+
+    float32x4_t abs_x    = vabsq_f32(x);
+    uint32x4_t  neg_mask = vcltq_f32(x, zeros);
+
+    // Accurate t = 1 / (1 + p*|x|) via two Newton-Raphson refinements on vrecpeq
+    // vrecpeq gives ~8-bit estimate; each NR step doubles precision
+    float32x4_t denom = vfmaq_f32(ones, p_coef, abs_x);  // 1 + p*|x|
+    float32x4_t t     = vrecpeq_f32(denom);               // ~8-bit estimate
+    t = vmulq_f32(t, vfmsq_f32(vdupq_n_f32(2.0f), t, denom));  // NR step 1 -> ~16-bit
+    t = vmulq_f32(t, vfmsq_f32(vdupq_n_f32(2.0f), t, denom));  // NR step 2 -> ~24-bit
+
+    // pdf(|x|) = (1/sqrt(2pi)) * exp(-|x|²/2)
+    float32x4_t exp_arg = vmulq_f32(vmulq_f32(abs_x, abs_x), vdupq_n_f32(-0.5f));
+    float32x4_t pdf_v   = vmulq_f32(inv_sqrt2pi, neon_exp(exp_arg));
+
+    // A&S polynomial in t (Horner): t*(b1 + t*(b2 + t*(b3 + t*(b4 + t*b5))))
+    float32x4_t poly = vdupq_n_f32(1.330274429f);
+    poly = vfmaq_f32(vdupq_n_f32(-1.821255978f), poly, t);
+    poly = vfmaq_f32(vdupq_n_f32( 1.781477937f), poly, t);
+    poly = vfmaq_f32(vdupq_n_f32(-0.356563782f), poly, t);
+    poly = vfmaq_f32(vdupq_n_f32( 0.319381530f), poly, t);
+    poly = vmulq_f32(poly, t);
+
+    // N(|x|) = 1 - pdf * poly
+    float32x4_t cdf_pos = vfmsq_f32(ones, pdf_v, poly);
+    float32x4_t cdf_neg = vsubq_f32(ones, cdf_pos);
+    return vbslq_f32(neg_mask, cdf_neg, cdf_pos);
+}
+
+void SIMDBatchPricer::priceNEON(const BatchInput& in, float* out, std::size_t n) {
+    const std::size_t vec_n = (n / 4) * 4;
+
+    const float32x4_t ones = vdupq_n_f32(1.0f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t neg1 = vdupq_n_f32(-1.0f);
+
+    for (std::size_t i = 0; i < vec_n; i += 4) {
+        float32x4_t S     = vld1q_f32(in.S     + i);
+        float32x4_t K     = vld1q_f32(in.K     + i);
+        float32x4_t r     = vld1q_f32(in.r     + i);
+        float32x4_t q     = vld1q_f32(in.q     + i);
+        float32x4_t sigma = vld1q_f32(in.sigma  + i);
+        float32x4_t T     = vld1q_f32(in.T     + i);
+
+        float32x4_t sqrtT  = vsqrtq_f32(T);
+        float32x4_t sigma2 = vmulq_f32(sigma, sigma);
+
+        // d1 = (log(S/K) + (r - q + 0.5*sigma²)*T) / (sigma*sqrtT)
+        float32x4_t log_SK = neon_log(vdivq_f32(S, K));
+        float32x4_t drift  = vfmaq_f32(vsubq_f32(r, q), half, sigma2);
+        float32x4_t d1     = vdivq_f32(
+            vfmaq_f32(log_SK, drift, T),
+            vmulq_f32(sigma, sqrtT));
+        float32x4_t d2 = vfmsq_f32(d1, sigma, sqrtT);
+
+        // Discount factors
+        float32x4_t df   = neon_exp(vmulq_f32(vmulq_f32(r, T), neg1));
+        float32x4_t df_q = neon_exp(vmulq_f32(vmulq_f32(q, T), neg1));
+
+        float32x4_t Nd1  = neon_norm_cdf(d1);
+        float32x4_t Nd2  = neon_norm_cdf(d2);
+        float32x4_t Nd1n = vsubq_f32(ones, Nd1);
+        float32x4_t Nd2n = vsubq_f32(ones, Nd2);
+
+        // Call = S*df_q*N(d1) - K*df*N(d2)
+        float32x4_t call_p = vfmsq_f32(
+            vmulq_f32(vmulq_f32(S, df_q), Nd1),
+            vmulq_f32(K, df), Nd2);
+        // Put = K*df*N(-d2) - S*df_q*N(-d1)
+        float32x4_t put_p = vfmsq_f32(
+            vmulq_f32(vmulq_f32(K, df), Nd2n),
+            vmulq_f32(S, df_q), Nd1n);
+
+        // Select call/put via type mask
+        int32x4_t   type_i   = vld1q_s32(in.type + i);
+        uint32x4_t  put_mask = vceqq_s32(type_i, vdupq_n_s32(1));
+        float32x4_t result   = vbslq_f32(put_mask, put_p, call_p);
+
+        vst1q_f32(out + i, result);
+    }
+
+    // Scalar tail
+    if (vec_n < n) {
+        BatchInput tail = in;
+        tail.S += vec_n; tail.K += vec_n; tail.r += vec_n;
+        tail.q += vec_n; tail.sigma += vec_n; tail.T += vec_n;
+        tail.type += vec_n;
+        priceScalar(tail, out + vec_n, n - vec_n);
+    }
+}
+
+#endif // PRICING_HAS_NEON
+
 #if PRICING_HAS_SSE4
+
+static inline __m128 sse4_norm_cdf(__m128 x) {
+    const __m128 ones  = _mm_set1_ps(1.0f);
+    const __m128 zeros = _mm_setzero_ps();
+    const __m128 p     = _mm_set1_ps(0.2316419f);
+    const __m128 b1    = _mm_set1_ps( 0.319381530f);
+    const __m128 b2    = _mm_set1_ps(-0.356563782f);
+    const __m128 b3    = _mm_set1_ps( 1.781477937f);
+    const __m128 b4    = _mm_set1_ps(-1.821255978f);
+    const __m128 b5    = _mm_set1_ps( 1.330274429f);
+    const __m128 inv_sqrt2pi = _mm_set1_ps(0.398942280f);
+
+    __m128 abs_x   = _mm_andnot_ps(_mm_set1_ps(-0.0f), x);
+    __m128 neg_mask = _mm_cmplt_ps(x, zeros);
+    __m128 t = _mm_rcp_ps(_mm_add_ps(_mm_mul_ps(p, abs_x), ones));
+
+    __m128 x2      = _mm_mul_ps(abs_x, abs_x);
+    __m128 exp_arg = _mm_mul_ps(x2, _mm_set1_ps(-0.5f));
+
+    // Simple exp approximation for SSE (less accurate but fast)
+    const __m128 log2e = _mm_set1_ps(1.44269504f);
+    const __m128 half  = _mm_set1_ps(0.5f);
+    __m128 fx = _mm_add_ps(_mm_mul_ps(exp_arg, log2e), half);
+    fx = _mm_floor_ps(fx);  // SSE4.1 _mm_floor_ps
+    __m128 tmp = _mm_sub_ps(exp_arg, _mm_mul_ps(fx, _mm_set1_ps(0.693147180f)));
+    __m128 y = _mm_add_ps(_mm_add_ps(
+        _mm_mul_ps(_mm_add_ps(_mm_mul_ps(_mm_set1_ps(0.0416667f), tmp),
+                               _mm_set1_ps(0.1666667f)), tmp),
+        _mm_mul_ps(_mm_set1_ps(0.5f), tmp)), ones);
+    y = _mm_add_ps(_mm_mul_ps(y, tmp), ones);
+    __m128i emm0 = _mm_add_epi32(_mm_cvttps_epi32(fx), _mm_set1_epi32(127));
+    emm0 = _mm_slli_epi32(emm0, 23);
+    __m128 exp_val = _mm_mul_ps(y, _mm_castsi128_ps(emm0));
+    __m128 pdf_val = _mm_mul_ps(inv_sqrt2pi, exp_val);
+
+    __m128 poly = _mm_add_ps(_mm_mul_ps(b5, t), b4);
+    poly = _mm_add_ps(_mm_mul_ps(poly, t), b3);
+    poly = _mm_add_ps(_mm_mul_ps(poly, t), b2);
+    poly = _mm_add_ps(_mm_mul_ps(poly, t), b1);
+    poly = _mm_mul_ps(poly, t);
+
+    __m128 cdf_pos = _mm_sub_ps(ones, _mm_mul_ps(pdf_val, poly));
+    __m128 cdf_neg = _mm_sub_ps(ones, cdf_pos);
+    return _mm_blendv_ps(cdf_pos, cdf_neg, neg_mask);
+}
 
 void SIMDBatchPricer::priceSSE4(const BatchInput& in, float* out, std::size_t n) {
     // SSE4.1 float polynomial approximations accumulate too much error for
@@ -334,9 +572,8 @@ void SIMDBatchPricer::priceSSE4(const BatchInput& in, float* out, std::size_t n)
 
         const double df    = std::exp(-r * T);
         const double df_q  = std::exp(-q * T);
-        constexpr double inv_sqrt2 = 1.0 / std::numbers::sqrt2;
-        const double Nd1   = 0.5 * std::erfc(-d1 * inv_sqrt2);
-        const double Nd2   = 0.5 * std::erfc(-d2 * inv_sqrt2);
+        const double Nd1   = 0.5 * std::erfc(-d1 * std::numbers::inv_sqrt2);
+        const double Nd2   = 0.5 * std::erfc(-d2 * std::numbers::inv_sqrt2);
 
         const double price = (in.type[i] == 0)
             ? S * df_q * Nd1 - K * df * Nd2
@@ -354,6 +591,8 @@ void SIMDBatchPricer::priceSSE4(const BatchInput& in, float* out, std::size_t n)
 void SIMDBatchPricer::price(const BatchInput& in, float* out_prices, std::size_t n) {
 #if PRICING_HAS_AVX2
     priceAVX2(in, out_prices, n);
+#elif PRICING_HAS_NEON
+    priceNEON(in, out_prices, n);
 #elif PRICING_HAS_SSE4
     priceSSE4(in, out_prices, n);
 #else

@@ -21,6 +21,12 @@
     #define PRICING_HAS_SSE4 0
 #endif
 
+#if defined(__ARM_NEON)
+    #define PRICING_HAS_NEON 1
+#else
+    #define PRICING_HAS_NEON 0
+#endif
+
 namespace pricing {
 
 // ─────────────────────────────────────────────
@@ -72,29 +78,23 @@ struct BatchOutput {
 //
 //  Prices N options in a single vectorised pass:
 //
-//  AVX2 path  (available on Intel Haswell 2013+, AMD Zen 2019+):
-//    Processes 8 float options per loop iteration using 256-bit
-//    YMM registers. Throughput: ~8x scalar for large batches.
+//  AVX2 path  (Intel Haswell 2013+ / AMD Zen 2019+):
+//    8 float options per iteration via 256-bit YMM registers.
 //
-//  SSE4.1 path (fallback, Intel Penryn 2007+):
-//    Processes 4 float options per loop iteration using 128-bit
-//    XMM registers. Throughput: ~4x scalar.
+//  NEON path  (Apple Silicon M1+ / ARM Cortex-A55+):
+//    4 float options per iteration via 128-bit NEON registers.
+//    Uses Cephes polynomial log/exp and A&S norm_cdf approximations
+//    ported to float32x4_t intrinsics. Runs natively — no Rosetta.
+//
+//  SSE4.1 path (Intel Penryn 2007+ / Apple Silicon via Rosetta):
+//    Scalar double loop — correct but no vectorisation benefit.
 //
 //  Scalar fallback:
-//    Delegates to BlackScholesEngine for each option. No SIMD.
-//    Used when neither AVX2 nor SSE4.1 is available.
+//    Delegates to BlackScholesEngine. Used when no SIMD is available.
 //
-//  All paths produce identical results to within float precision.
-//  For positions/risk where double precision matters, use
-//  BlackScholesEngine directly.
-//
-//  Key implementation techniques:
-//    - Abramowitz & Stegun rational approximation for norm_cdf
-//      (max error ~1.5e-7) — avoids erfc which has no SIMD equivalent
-//    - exp() via _mm256_exp_ps / Cephes polynomial approximation
-//    - log() via _mm256_log_ps / bit manipulation
-//    - All intermediate values stay in registers; zero heap allocation
-//      in the hot loop
+//  Key techniques: Cephes polynomial exp, atanh-based log with range
+//  reduction, A&S §26.2.17 norm_cdf, FMA, SoA layout, zero heap
+//  allocation in the hot loop.
 // ─────────────────────────────────────────────
 class SIMDBatchPricer {
 public:
@@ -116,6 +116,9 @@ private:
 #if PRICING_HAS_AVX2
     static void priceAVX2  (const BatchInput& in, float* out, std::size_t n);
     static void greeksAVX2 (const BatchInput& in, BatchOutput& out, std::size_t n);
+#endif
+#if PRICING_HAS_NEON
+    static void priceNEON  (const BatchInput& in, float* out, std::size_t n);
 #endif
 #if PRICING_HAS_SSE4
     static void priceSSE4  (const BatchInput& in, float* out, std::size_t n);

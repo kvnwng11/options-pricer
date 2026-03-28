@@ -11,7 +11,6 @@
 #include <iostream>
 #include <numeric>
 #include <vector>
-#include <x86intrin.h>  // _mm_lfence (used by SSE4 path in simd_pricer.cpp)
 
 using namespace pricing;
 
